@@ -16,12 +16,37 @@
 Preferences prefs;
 String apSSID = "Czech Blade";
 String apPass = "12345678";
-String currentLang = "eng";
+bool ledEnabled = true;
+String currentLang = "eng"; // Výchozí jazyk: English
+
+// Stavy pro potvrzení příkazů
+bool pendingRebootWeb = false;
+bool pendingRebootTelnet = false;
 
 AsyncWebServer server(80);
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+
+// Telnet buffer, kurzor a historie
+String telnetInputBuffer = "";
+int telnetCursorPos = 0;
+const int TELNET_HIST_SIZE = 10;
+String telnetHistory[TELNET_HIST_SIZE];
+int telnetHistCount = 0;
+int telnetHistIdx = -1;
+
 BLEScan* pBLEScan = nullptr;
 
-// Globální mezipaměť pro neblokující BLE výsledky
+// Paměť pro očíslované Wi-Fi sítě
+struct ScannedNet {
+  String ssid;
+  int rssi;
+  int ch;
+  String bssid;
+};
+std::vector<ScannedNet> lastScannedNets;
+
+// Paměť pro neblokující BLE výsledky
 struct BleDeviceItem {
   String name;
   String mac;
@@ -30,21 +55,75 @@ struct BleDeviceItem {
 std::vector<BleDeviceItem> bleResults;
 volatile bool isBleScanning = false;
 
-// Signalizace v1.5: 1x dlouhé bliknutí + 5x krátké bliknutí
-void blinkVersion1_5() {
-  // 1x dlouhé (verze 1)
-  digitalWrite(LED_PIN, HIGH);
-  delay(1000);
-  digitalWrite(LED_PIN, LOW);
-  delay(500);
+// Seznam příkazů pro automatické doplňování (TAB completion)
+const std::vector<String> commandList = {
+  "help", "wifi help", "wifi scan", "wifi connect", "wifi disconnect", "wifi status", "wifi signal",
+  "wifi-repeat", "signal", "bt help", "bt scan", "ping", "set help",
+  "set setap", "set lang", "set lang-d", "status", "status ip", "log",
+  "led", "led on", "led off", "sleep", "reboot", "clear"
+};
 
-  // 5x krátké (podverze .5)
-  for (int i = 0; i < 5; i++) {
+// ANSI barvy pro Telnet
+#define ANSI_RESET  "\033[0m"
+#define ANSI_BOLD   "\033[1m"
+#define ANSI_RED    "\033[31m"
+#define ANSI_GREEN  "\033[32m"
+#define ANSI_YELLOW "\033[33m"
+#define ANSI_BLUE   "\033[34m"
+#define ANSI_CYAN   "\033[36m"
+#define ANSI_ORANGE "\033[38;5;208m"
+
+void blinkLed(int times, int delayMs) {
+  if (!ledEnabled) return;
+  for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, HIGH);
-    delay(100);
+    delay(delayMs);
     digitalWrite(LED_PIN, LOW);
-    delay(150);
+    delay(delayMs);
   }
+}
+
+void setLedState(bool state) {
+  if (ledEnabled && state) {
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+// Signalizace startu verze 3.0: 3x dlouhé bliknutí
+void blinkVersion3_0() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(1000);
+    digitalWrite(LED_PIN, LOW);
+    delay(400);
+  }
+}
+
+// Sjednocený přechod do spánku
+void executeSleep(int sleepSec = 0) {
+  digitalWrite(LED_PIN, LOW);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  if (sleepSec > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
+  }
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Probuzení tlačítkem BOOT (GPIO 0) nebo EN/RST
+  esp_deep_sleep_start();
+}
+
+String resolveSSID(String param) {
+  param.trim();
+  if (param.startsWith("n ") || param.startsWith("N ")) {
+    int num = param.substring(2).toInt();
+    if (num >= 1 && num <= (int)lastScannedNets.size()) {
+      return lastScannedNets[num - 1].ssid;
+    }
+  }
+  return param;
 }
 
 // Callback po dokončení BLE skenu
@@ -61,6 +140,461 @@ void onBleScanComplete(BLEScanResults results) {
   pBLEScan->clearResults();
   digitalWrite(LED_PIN, LOW);
   isBleScanning = false;
+}
+
+// Jádro parseru příkazů pro Web Shell i Telnet
+String processCommand(String cmd, bool isTelnet = false) {
+  cmd.trim();
+  String out = "";
+  bool cz = (currentLang == "cz");
+
+  if (cmd == "settings") cmd = "set";
+  else if (cmd.startsWith("settings ")) {
+    cmd = "set " + cmd.substring(9);
+  }
+
+  if (cmd == "hack" || cmd == "matrix") cmd = "log";
+
+  auto col = [&](const char* ansiCode) -> String {
+    return isTelnet ? String(ansiCode) : String("");
+  };
+
+  // HLAVNÍ NÁPOVĚDA
+  if (cmd == "help") {
+    if (cz) {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== CzechBlade prikazy ===" + col(ANSI_RESET) + "\n"
+            " - " + col(ANSI_GREEN) + "wifi" + col(ANSI_RESET) + "         : Wi-Fi prikazy (viz 'wifi help')\n"
+            " - " + col(ANSI_GREEN) + "signal" + col(ANSI_RESET) + "       : Signal telefonu k modulu\n"
+            " - " + col(ANSI_GREEN) + "bt" + col(ANSI_RESET) + "           : Bluetooth LE prikazy (viz 'bt help')\n"
+            " - " + col(ANSI_GREEN) + "ping" + col(ANSI_RESET) + "         : Test odezvy (samotny pingne 1.1.1.1)\n"
+            " - " + col(ANSI_GREEN) + "set" + col(ANSI_RESET) + "          : Nastaveni zarizeni (viz 'set help')\n"
+            " - " + col(ANSI_GREEN) + "status" + col(ANSI_RESET) + "       : Stav systemu (nebo 'status ip')\n"
+            " - " + col(ANSI_GREEN) + "log" + col(ANSI_RESET) + "          : Hackersky log\n"
+            " - " + col(ANSI_GREEN) + "led" + col(ANSI_RESET) + "          : Prepinac LED (nebo 'led on/off')\n"
+            " - " + col(ANSI_GREEN) + "sleep [sec]" + col(ANSI_RESET) + "  : Uspani modulu (probuzeni BOOT/RST)\n"
+            " - " + col(ANSI_GREEN) + "reboot" + col(ANSI_RESET) + "       : Restart modulu s potvrzenim [y/N]\n"
+            " - " + col(ANSI_GREEN) + "clear" + col(ANSI_RESET) + "        : Vymaze konzoli\n"
+            "Tip: Stisknete TAB pro automaticke doplneni prikazu.";
+    } else {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== CzechBlade commands ===" + col(ANSI_RESET) + "\n"
+            " - " + col(ANSI_GREEN) + "wifi" + col(ANSI_RESET) + "         : Wi-Fi commands (see 'wifi help')\n"
+            " - " + col(ANSI_GREEN) + "signal" + col(ANSI_RESET) + "       : Phone signal to module\n"
+            " - " + col(ANSI_GREEN) + "bt" + col(ANSI_RESET) + "           : Bluetooth LE commands (see 'bt help')\n"
+            " - " + col(ANSI_GREEN) + "ping" + col(ANSI_RESET) + "         : Latency test (defaults to 1.1.1.1)\n"
+            " - " + col(ANSI_GREEN) + "set" + col(ANSI_RESET) + "          : Device settings (see 'set help')\n"
+            " - " + col(ANSI_GREEN) + "status" + col(ANSI_RESET) + "       : System status (or 'status ip')\n"
+            " - " + col(ANSI_GREEN) + "log" + col(ANSI_RESET) + "          : Hacking log\n"
+            " - " + col(ANSI_GREEN) + "led" + col(ANSI_RESET) + "          : Toggle LED (or 'led on/off')\n"
+            " - " + col(ANSI_GREEN) + "sleep [sec]" + col(ANSI_RESET) + "  : Sleep module (wake up via BOOT/RST)\n"
+            " - " + col(ANSI_GREEN) + "reboot" + col(ANSI_RESET) + "       : Restart module with confirmation [y/N]\n"
+            " - " + col(ANSI_GREEN) + "clear" + col(ANSI_RESET) + "        : Clear console\n"
+            "Tip: Press TAB for auto-completion.";
+    }
+  } 
+  else if (cmd == "wifi") {
+    out = cz ? "Neznamy prikaz. Pouzijte 'wifi help' pro prehled Wi-Fi prikazu." 
+             : "Unknown command. Use 'wifi help' for Wi-Fi commands list.";
+  }
+  else if (cmd == "wifi help") {
+    if (cz) {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Wi-Fi prikazy ===" + col(ANSI_RESET) + "\n"
+            " - wifi scan                  : Vyhleda a ocisluje site v okoli (1, 2, 3...)\n"
+            " - wifi connect <SSID|n X>    : Pripojeni k siti podle nazvu nebo cisla (napr. 'wifi connect n 1')\n"
+            " - wifi disconnect            : Odpojeni od routeru\n"
+            " - wifi status                : Stav aktualniho pripojeni k siti\n"
+            " - wifi signal [SSID|n X]     : Mereni signalu pripojene site (nebo vybrane ze scanu)\n"
+            " - wifi signal-<sec> [cil]    : Mereni signalu na X sekund (napr. 'wifi signal-10 n 1')\n"
+            " - wifi-repeat <SSID|n X>     : Klonovani site jako novy AP (heslo 12345678)";
+    } else {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Wi-Fi commands ===" + col(ANSI_RESET) + "\n"
+            " - wifi scan                  : Scans and numbers nearby networks (1, 2, 3...)\n"
+            " - wifi connect <SSID|n X>    : Connect by SSID or scan number (e.g. 'wifi connect n 1')\n"
+            " - wifi disconnect            : Disconnect from network\n"
+            " - wifi status                : Current Wi-Fi connection status\n"
+            " - wifi signal [SSID|n X]     : Measure signal of connected or scanned network\n"
+            " - wifi signal-<sec> [target] : Measure signal for X seconds (e.g. 'wifi signal-10 n 1')\n"
+            " - wifi-repeat <SSID|n X>     : Clone network as new AP (password 12345678)";
+    }
+  }
+  else if (cmd == "wifi status") {
+    if (WiFi.status() == WL_CONNECTED) {
+      out = col(ANSI_GREEN) + (cz ? "Wi-Fi: PRIPOJENO\n" : "Wi-Fi: CONNECTED\n") + col(ANSI_RESET);
+      out += "SSID: " + col(ANSI_YELLOW) + WiFi.SSID() + col(ANSI_RESET) + "\n";
+      out += "IP: " + WiFi.localIP().toString() + "\n";
+      out += "Signal: " + String(WiFi.RSSI()) + " dBm";
+    } else {
+      out = col(ANSI_RED) + (cz ? "Wi-Fi: NEPRIPOJENO (Offline)" : "Wi-Fi: DISCONNECTED (Offline)") + col(ANSI_RESET);
+    }
+  }
+  else if (cmd == "wifi scan") {
+    setLedState(true);
+    int n = WiFi.scanNetworks(false, true);
+    lastScannedNets.clear();
+
+    out = cz ? ("Nalezeno " + String(n) + " Wi-Fi siti:\n") : ("Found " + String(n) + " Wi-Fi networks:\n");
+    for (int i = 0; i < n; i++) {
+      ScannedNet item;
+      item.ssid = WiFi.SSID(i);
+      item.rssi = WiFi.RSSI(i);
+      item.ch = WiFi.channel(i);
+      item.bssid = WiFi.BSSIDstr(i);
+      lastScannedNets.push_back(item);
+
+      out += col(ANSI_CYAN) + String(i + 1) + ". " + col(ANSI_RESET);
+      out += "[" + col(ANSI_YELLOW) + String(item.rssi) + " dBm" + col(ANSI_RESET) + "] ";
+      out += col(ANSI_BOLD) + (item.ssid.length() > 0 ? item.ssid : "(Hidden)") + col(ANSI_RESET);
+      out += " (k." + String(item.ch) + ", " + item.bssid + ")\n";
+    }
+    WiFi.scanDelete();
+    setLedState(false);
+  }
+  else if (cmd.startsWith("wifi connect")) {
+    String params = cmd.substring(12);
+    params.trim();
+    String sSsid = "";
+    String sPass = "";
+
+    if (params.startsWith("n ") || params.startsWith("N ")) {
+      String sub = params.substring(2);
+      sub.trim();
+      int spaceIdx = sub.indexOf(' ');
+      if (spaceIdx > 0) {
+        int idx = sub.substring(0, spaceIdx).toInt();
+        sPass = sub.substring(spaceIdx + 1);
+        sPass.trim();
+        if (idx >= 1 && idx <= (int)lastScannedNets.size()) {
+          sSsid = lastScannedNets[idx - 1].ssid;
+        }
+      } else {
+        int idx = sub.toInt();
+        if (idx >= 1 && idx <= (int)lastScannedNets.size()) {
+          sSsid = lastScannedNets[idx - 1].ssid;
+        }
+      }
+    } else {
+      int spaceIdx = params.indexOf(' ');
+      if (spaceIdx > 0) {
+        sSsid = params.substring(0, spaceIdx);
+        sPass = params.substring(spaceIdx + 1);
+        sPass.trim();
+      } else {
+        sSsid = params;
+      }
+    }
+
+    if (sSsid.length() == 0) {
+      return col(ANSI_RED) + (cz ? "Chyba: Zadejte platne SSID nebo 'n <cislo>'!" : "Error: Specify valid SSID or 'n <number>'!") + col(ANSI_RESET);
+    }
+
+    out = cz ? ("Pripojuji k '" + sSsid + "'...") : ("Connecting to '" + sSsid + "'...");
+    setLedState(true);
+    WiFi.begin(sSsid.c_str(), sPass.length() > 0 ? sPass.c_str() : NULL);
+    int t = 0;
+    while (WiFi.status() != WL_CONNECTED && t < 25) {
+      delay(200);
+      t++;
+    }
+    setLedState(false);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      out += col(ANSI_GREEN) + (cz ? ("\nPripojeno! IP adresa: " + WiFi.localIP().toString()) : ("\nConnected! IP address: " + WiFi.localIP().toString())) + col(ANSI_RESET);
+    } else {
+      out += col(ANSI_RED) + (cz ? "\nChyba: Pripojeni selhalo." : "\nError: Connection failed.") + col(ANSI_RESET);
+    }
+  }
+  else if (cmd == "wifi disconnect") {
+    WiFi.disconnect(false, true);
+    out = cz ? "Rozhrani STA odpojeno od routeru." : "STA interface disconnected from router.";
+  }
+  else if (cmd.startsWith("wifi signal")) {
+    int durationSec = 5;
+    String targetParam = "";
+
+    String sigPart = cmd.substring(5);
+    sigPart.trim();
+
+    if (sigPart.startsWith("signal-")) {
+      int spaceIdx = sigPart.indexOf(' ');
+      if (spaceIdx > 0) {
+        durationSec = sigPart.substring(7, spaceIdx).toInt();
+        targetParam = sigPart.substring(spaceIdx + 1);
+      } else {
+        durationSec = sigPart.substring(7).toInt();
+      }
+    } else if (sigPart.startsWith("signal ")) {
+      targetParam = sigPart.substring(7);
+    }
+
+    if (durationSec <= 0) durationSec = 5;
+    targetParam.trim();
+
+    String target = "";
+    if (targetParam.length() > 0) {
+      target = resolveSSID(targetParam);
+    } else {
+      if (WiFi.status() == WL_CONNECTED) {
+        target = WiFi.SSID();
+      } else {
+        return col(ANSI_RED) + (cz ? "Chyba: Nejste pripojeni k zadne Wi-Fi siti!" : "Error: Not connected to any Wi-Fi!") + col(ANSI_RESET);
+      }
+    }
+
+    out = (cz ? "Merim signal pro '" : "Measuring signal for '") + target + "' (" + String(durationSec) + "s stream):\n";
+    for (int sec = 1; sec <= durationSec; sec++) {
+      int curRssi = -105;
+      if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == target) {
+        curRssi = WiFi.RSSI();
+      } else {
+        setLedState(true);
+        int n = WiFi.scanNetworks(false, true);
+        for (int i = 0; i < n; i++) {
+          if (WiFi.SSID(i) == target && WiFi.RSSI(i) > curRssi) {
+            curRssi = WiFi.RSSI(i);
+          }
+        }
+        WiFi.scanDelete();
+        setLedState(false);
+      }
+
+      if (curRssi > -105) {
+        out += " [T+" + String(sec) + "s] " + col(ANSI_YELLOW) + String(curRssi) + " dBm" + col(ANSI_RESET) + "\n";
+      } else {
+        out += " [T+" + String(sec) + "s] " + col(ANSI_RED) + (cz ? "Mimo dosah" : "Out of range") + col(ANSI_RESET) + "\n";
+      }
+
+      if (sec < durationSec) delay(1000);
+    }
+    out.trim();
+  }
+  else if (cmd.startsWith("wifi-repeat")) {
+    String param = cmd.length() > 11 ? cmd.substring(11) : "";
+    param.trim();
+    String target = resolveSSID(param);
+
+    if (target.length() == 0 && WiFi.status() == WL_CONNECTED) {
+      target = WiFi.SSID();
+    }
+
+    if (target.length() == 0) {
+      return col(ANSI_RED) + (cz ? "Chyba: Zadejte SSID nebo cislo site 'n <cislo>'!" : "Error: Specify SSID or number 'n <number>'!") + col(ANSI_RESET);
+    }
+
+    apSSID = target + "_EXT";
+    apPass = "12345678";
+    out = cz ? ("Klonuji sit na SSID: '" + apSSID + "' s heslem '12345678'. Restartuji AP...") : ("Cloning network to SSID: '" + apSSID + "' with pass '12345678'. Restarting AP...");
+    blinkLed(4, 50);
+    WiFi.softAPdisconnect(true);
+    WiFi.softAP(apSSID.c_str(), apPass.c_str());
+  }
+  else if (cmd == "signal") {
+    wifi_sta_list_t sta_list;
+    esp_wifi_ap_get_sta_list(&sta_list);
+    if (sta_list.num > 0) {
+      out = (cz ? "Signal pripojeneho telefonu: " : "Connected phone signal: ") + col(ANSI_YELLOW) + String(sta_list.sta[0].rssi) + " dBm" + col(ANSI_RESET);
+    } else {
+      out = col(ANSI_RED) + (cz ? "K Access Pointu Czech Blade neni aktualne pripojen zadny klient." : "No clients currently connected to Czech Blade Access Point.") + col(ANSI_RESET);
+    }
+  }
+  else if (cmd == "bt") {
+    out = cz ? "Pouziti: 'bt scan' pro sken majaku nebo 'bt help' pro napovedu."
+             : "Usage: 'bt scan' to scan beacons or 'bt help' for help.";
+  }
+  else if (cmd == "bt help") {
+    if (cz) {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Bluetooth LE prikazy ===" + col(ANSI_RESET) + "\n"
+            " - bt scan : 2sekundovy sken BLE majaku v okoli (AirTagy, hodinky, senzory)";
+    } else {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Bluetooth LE commands ===" + col(ANSI_RESET) + "\n"
+            " - bt scan : 2-second scan of nearby BLE beacons (AirTags, watches, sensors)";
+    }
+  }
+  else if (cmd == "bt scan") {
+    out = cz ? "Skenuji BLE v okoli (2 sekundy)...\n" : "Scanning BLE devices (2 seconds)...\n";
+    setLedState(true);
+    pBLEScan->stop();
+    pBLEScan->clearResults();
+    BLEScanResults found = pBLEScan->start(2, false);
+    out += (cz ? "Nalezeno " : "Found ") + String(found.getCount()) + " BLE devices:\n";
+    for (int i = 0; i < found.getCount(); i++) {
+      BLEAdvertisedDevice d = found.getDevice(i);
+      out += " - [" + col(ANSI_YELLOW) + String(d.getRSSI()) + " dBm" + col(ANSI_RESET) + "] " + 
+             col(ANSI_BOLD) + (d.haveName() ? d.getName().c_str() : "(Unknown)") + col(ANSI_RESET) + 
+             " (" + d.getAddress().toString().c_str() + ")\n";
+    }
+    pBLEScan->clearResults();
+    setLedState(false);
+  }
+  else if (cmd == "ping" || cmd.startsWith("ping ")) {
+    String target = "1.1.1.1";
+    if (cmd.startsWith("ping ")) {
+      target = cmd.substring(5);
+      target.trim();
+      if (target == "1") target = "1.1.1.1";
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      out = col(ANSI_RED) + (cz ? "Chyba: Czech Blade neni pripojen k Wi-Fi (offline)." : "Error: Czech Blade is not connected to Wi-Fi (offline).") + col(ANSI_RESET);
+    } else {
+      setLedState(true);
+      int success = 0;
+      float total = 0;
+      for (int i = 0; i < 4; i++) {
+        if (Ping.ping(target.c_str(), 1)) {
+          success++;
+          total += Ping.averageTime();
+        }
+        delay(20);
+      }
+      setLedState(false);
+
+      if (success > 0) {
+        out = col(ANSI_GREEN) + "Ping -> " + target + ": " + String(success) + "/4 " + (cz ? "paketu OK | Prumer: " : "packets OK | Avg: ") + String((int)(total / success)) + " ms" + col(ANSI_RESET);
+      } else {
+        out = col(ANSI_RED) + "Ping -> " + target + (cz ? ": Hostitel neodpovida." : ": Host unreachable.") + col(ANSI_RESET);
+      }
+    }
+  }
+  else if (cmd == "set") {
+    out = cz ? "Pouziti: 'set help' pro napovedu k nastaveni."
+             : "Usage: 'set help' for settings help.";
+  }
+  else if (cmd == "set help") {
+    if (cz) {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Nastaveni ===" + col(ANSI_RESET) + "\n"
+            " - set setap <SSID> <heslo> : Zmena nazvu a hesla AP site (min. 8 znaku)\n"
+            " - set lang <cz|eng>        : Docasna zmena jazyka pro tuto relaci\n"
+            " - set lang-d <cz|eng>      : Trvala zmena vychoziho jazyka do pameti";
+    } else {
+      out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== Settings ===" + col(ANSI_RESET) + "\n"
+            " - set setap <SSID> <pass>  : Change AP network SSID and password (min. 8 chars)\n"
+            " - set lang <cz|eng>        : Temporarily change language for this session\n"
+            " - set lang-d <cz|eng>      : Permanently save default language to memory";
+    }
+  }
+  else if (cmd.startsWith("set setap ")) {
+    String params = cmd.substring(10);
+    params.trim();
+    int spaceIdx = params.indexOf(' ');
+    if (spaceIdx > 0) {
+      String nSsid = params.substring(0, spaceIdx);
+      String nPass = params.substring(spaceIdx + 1);
+      nPass.trim();
+      if (nPass.length() < 8) {
+        out = col(ANSI_RED) + (cz ? "Chyba: Heslo musi mit alespon 8 znaku!" : "Error: Password must be at least 8 characters long!") + col(ANSI_RESET);
+      } else {
+        apSSID = nSsid;
+        apPass = nPass;
+        out = col(ANSI_GREEN) + (cz ? ("AP prenastaveno na '" + apSSID + "'. Restartuji Wi-Fi AP...") : ("AP reconfigured to '" + apSSID + "'. Restarting AP...")) + col(ANSI_RESET);
+        blinkLed(4, 50);
+        WiFi.softAPdisconnect(true);
+        WiFi.softAP(apSSID.c_str(), apPass.c_str());
+      }
+    } else {
+      out = cz ? "Pouziti: set setap <SSID> <heslo>" : "Usage: set setap <SSID> <password>";
+    }
+  }
+  else if (cmd.startsWith("set lang ")) {
+    String l = cmd.substring(9);
+    l.trim();
+    l.toLowerCase();
+    if (l == "cz" || l == "eng" || l == "en") {
+      currentLang = (l == "cz") ? "cz" : "eng";
+      out = col(ANSI_GREEN) + ((currentLang == "cz") ? "Docasny jazyk nastaven na: Cestina (CZ)" : "Temporary language set to: English (ENG)") + col(ANSI_RESET);
+    } else {
+      out = cz ? "Pouziti: set lang <cz|eng>" : "Usage: set lang <cz|eng>";
+    }
+  }
+  else if (cmd.startsWith("set lang-d ")) {
+    String l = cmd.substring(11);
+    l.trim();
+    l.toLowerCase();
+    if (l == "cz" || l == "eng" || l == "en") {
+      currentLang = (l == "cz") ? "cz" : "eng";
+      prefs.begin("blade", false);
+      prefs.putString("lang", currentLang);
+      prefs.end();
+      out = col(ANSI_GREEN) + ((currentLang == "cz") ? "Trvaly vychozi jazyk ulozen: Cestina (CZ)" : "Default permanent language saved: English (ENG)") + col(ANSI_RESET);
+    } else {
+      out = cz ? "Pouziti: set lang-d <cz|eng>" : "Usage: set lang-d <cz|eng>";
+    }
+  }
+  else if (cmd == "status ip") {
+    out = col(ANSI_BOLD) + "AP  IP: " + col(ANSI_RESET) + WiFi.softAPIP().toString() + "\n";
+    out += col(ANSI_BOLD) + "STA IP: " + col(ANSI_RESET) + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("Offline"));
+  }
+  else if (cmd == "status" || cmd == "info") {
+    out = col(ANSI_BOLD) + col(ANSI_CYAN) + "=== CZECH BLADE SYSTEM INFO ===" + col(ANSI_RESET) + "\n";
+    out += "AP SSID: " + col(ANSI_YELLOW) + apSSID + col(ANSI_RESET) + " (IP: " + WiFi.softAPIP().toString() + ")\n";
+    out += "STA Status: " + String(WiFi.status() == WL_CONNECTED ? ((cz ? "Pripojeno k " : "Connected to ") + col(ANSI_YELLOW) + WiFi.SSID() + col(ANSI_RESET) + " (IP: " + WiFi.localIP().toString() + ")") : (cz ? "Nepripojeno" : "Disconnected")) + "\n";
+    out += "MAC AP: " + WiFi.softAPmacAddress() + "\n";
+    out += "MAC STA: " + WiFi.macAddress() + "\n";
+    out += (cz ? "Volna RAM: " : "Free RAM: ") + String(ESP.getFreeHeap() / 1024) + " KB\n";
+    out += (cz ? "LED indikace: " : "LED indicator: ") + String(ledEnabled ? (cz ? "ZAPNUTA" : "ENABLED") : (cz ? "VYPNUTA" : "DISABLED")) + "\n";
+    out += (cz ? "Jazyk: " : "Language: ") + (currentLang == "cz" ? String("CZ") : String("ENG"));
+  }
+  else if (cmd == "log") {
+    out = col(ANSI_GREEN) +
+          "[*] INITIATING PENETRATION SEQUENCE (v4.82-sec)...\n"
+          "[*] Target host: 192.168.1.1 (subnet probe active)\n"
+          "[*] Port scanning [21, 22, 23, 80, 443, 8080]... open: [22, 80]\n"
+          "[*] Probing memory stack offset: 0x7FFF" + String(random(1000, 9999), HEX) + "\n"
+          "[+] Heap corruption detected. Injecting NOP sled (128 bytes)...\n"
+          "[+] Return pointer hijacked: [EIP -> 0x0040" + String(random(10, 99), HEX) + "]\n"
+          "[*] Evading signature IDS/IPS filters... [BYPASSED]\n"
+          "[*] Dumping shadow credential storage (SHA512):\n"
+          "    > [UID 0] root: $6$z8F9..." + String(random(100000, 999999)) + " -> Hash MATCH!\n"
+          "    > [UID 1000] operator: $6$dK31..." + String(random(100000, 999999)) + " -> Hash MATCH!\n"
+          "[+] Cryptographic handshake established via port 1337\n"
+          "[*] Deploying daemon backdoor to /tmp/.sys_kernel_hook\n"
+          "[!] ELEVATING USER PRIVILEGES: [UID=0(root) GID=0(root)]\n"
+          "[*] SESSION ACTIVE. ENCRYPTED SHELL READY." + col(ANSI_RESET);
+  }
+  else if (cmd == "led") {
+    ledEnabled = !ledEnabled;
+    if (ledEnabled) {
+      blinkLed(3, 80);
+      out = cz ? "Indikacni LED zapnuta (3x problikla)." : "Indicator LED enabled (blinked 3x).";
+    } else {
+      digitalWrite(LED_PIN, LOW);
+      out = cz ? "Indikacni LED vypnuta." : "Indicator LED disabled.";
+    }
+  }
+  else if (cmd == "led on") {
+    ledEnabled = true;
+    blinkLed(3, 80);
+    out = cz ? "Indikacni LED zapnuta (3x problikla)." : "Indicator LED enabled (blinked 3x).";
+  }
+  else if (cmd == "led off") {
+    ledEnabled = false;
+    digitalWrite(LED_PIN, LOW);
+    out = cz ? "Indikacni LED vypnuta (bude trvale zhasnuta)." : "Indicator LED disabled (permanently off).";
+  }
+  else if (cmd == "sleep" || cmd.startsWith("sleep ")) {
+    int sleepSec = 0;
+    if (cmd.startsWith("sleep ")) {
+      sleepSec = cmd.substring(6).toInt();
+    }
+
+    if (sleepSec > 0) {
+      out = cz ? ("Czech Blade usina na " + String(sleepSec) + " sekund... (probuzeni tlacitkem BOOT/RST nebo casovacem)") 
+               : ("Czech Blade going to sleep for " + String(sleepSec) + " seconds... (wake up via BOOT/RST or timer)");
+    } else {
+      out = cz ? "Czech Blade usina... (probuzeni tlacitkem BOOT nebo EN/RST na desce)" 
+               : "Czech Blade going to sleep... (wake up via BOOT or EN/RST button)";
+    }
+
+    if (isTelnet) {
+      telnetClient.println(out);
+      telnetClient.flush();
+      delay(200);
+      executeSleep(sleepSec);
+    }
+  }
+  else {
+    out = col(ANSI_RED) + (cz ? ("Neznamy prikaz: '" + cmd + "'. Napiste 'help'.") : ("Unknown command: '" + cmd + "'. Type 'help'.")) + col(ANSI_RESET);
+  }
+
+  return out;
 }
 
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
@@ -324,6 +858,33 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       letter-spacing: 0.5px;
     }
 
+    /* Terminál */
+    .term-window {
+      background: #080a0d;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: var(--text);
+      line-height: 1.4;
+    }
+    .term-prompt { color: var(--green); font-weight: bold; }
+    .term-row { display: flex; gap: 8px; margin-top: 8px; }
+    .term-input {
+      flex: 1;
+      background: var(--surface-sub);
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 9px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      border-radius: 8px;
+    }
+
     input, select {
       width: 100%;
       padding: 9px 10px;
@@ -335,7 +896,7 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       font-size: 12px;
       border-radius: 8px;
     }
-    input:focus, select:focus {
+    input:focus, select:focus, .term-input:focus {
       outline: none;
       border-color: var(--orange);
     }
@@ -443,6 +1004,17 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       </div>
     </div>
 
+    <!-- 5. TERMINAL -->
+    <div id="p-term" class="panel">
+      <div class="block">
+        <div class="term-window" id="term-out"></div>
+        <div class="term-row">
+          <input type="text" id="term-in" class="term-input" placeholder="Type a command... (TAB to complete)" onkeydown="handleTermKey(event)">
+          <button class="sub-btn" style="padding: 0 16px;" onclick="sendTermCmd()">&gt;</button>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <div class="nav-bar">
@@ -450,6 +1022,7 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
     <button class="nav-tab" onclick="switchTab('geiger', this)"><span id="nav-text-geiger">TRACK</span></button>
     <button class="nav-tab" onclick="switchTab('ble', this)"><span id="nav-text-ble">BLE</span></button>
     <button class="nav-tab" onclick="switchTab('ping', this)"><span id="nav-text-ping">PING</span></button>
+    <button class="nav-tab" onclick="switchTab('term', this)"><span id="nav-text-term">SHELL</span></button>
   </div>
 
   <!-- MODAL: AUTH / CONNECT -->
@@ -500,9 +1073,19 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
     let selectedSsid = "";
     let isConnectedToWifi = false;
 
+    let cmdHistory = [];
+    let historyIdx = -1;
+
+    const tabCommands = [
+      "help", "wifi help", "wifi scan", "wifi connect", "wifi disconnect", "wifi status", "wifi signal",
+      "wifi-repeat", "signal", "bt help", "bt scan", "ping", "set help",
+      "set setap", "set lang", "set lang-d", "status", "status ip", "log",
+      "led", "led on", "led off", "sleep", "reboot", "clear"
+    ];
+
     const dict = {
       cz: {
-        nav_wifi: "WIFI", nav_geiger: "RADAR", nav_ble: "BLE", nav_ping: "PING",
+        nav_wifi: "WIFI", nav_geiger: "RADAR", nav_ble: "BLE", nav_ping: "PING", nav_term: "SHELL",
         hdr_wifi: "WLAN KONTROLÉR (2.4 GHz)", btn_scan_wifi: "SKENOVAT PÁSMO", scanning_wifi: "PROBÍHÁ SKENOVÁNÍ...",
         geiger_title: "ZAMĚŘOVAČ SIGNÁLU", geiger_standby: "POHOTOVOST",
         btn_geiger_start: "SPUSTIT ZAMĚŘOVÁNÍ", btn_geiger_stop: "ZASTAVIT", btn_measure: "ZAMĚŘIT",
@@ -511,10 +1094,11 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
         ping_exec: "Odesílám pakety na ", ping_ok: "HOSTITEL AKTIVNÍ", ping_fail: "HOSTITEL NEDOSTUPNÝ",
         modal_conn_title: "PŘIPOJENÍ K SÍTI", modal_conn_btn: "PŘIPOJIT", modal_cancel_btn: "ZRUŠIT",
         settings_title: "KONFIGURACE SYSTÉMU", lbl_lang: "JAZYK ROZHRANÍ:", lbl_ap_ssid: "VYSÍLANÉ SSID:", lbl_ap_pass: "HESLO K AP:",
-        btn_save_settings: "ULOŽIT A RESTART", btn_close_settings: "ZAVŘÍT"
+        btn_save_settings: "ULOŽIT A RESTART", btn_close_settings: "ZAVŘÍT",
+        term_init: "Czech Blade Shell v3.0\nZadejte 'help' pro seznam prikazu. (TAB = doplnovani)\n------------------------------------------------"
       },
       eng: {
-        nav_wifi: "WIFI", nav_geiger: "TRACK", nav_ble: "BLE", nav_ping: "PING",
+        nav_wifi: "WIFI", nav_geiger: "TRACK", nav_ble: "BLE", nav_ping: "PING", nav_term: "SHELL",
         hdr_wifi: "WLAN CONTROLLER (2.4 GHz)", btn_scan_wifi: "SCAN ACTIVE FREQUENCIES", scanning_wifi: "SCANNING AIRWAVES...",
         geiger_title: "SIGNAL DETECTOR", geiger_standby: "STANDBY",
         btn_geiger_start: "ENGAGE RECEIVER", btn_geiger_stop: "DISENGAGE", btn_measure: "TRACK",
@@ -523,7 +1107,8 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
         ping_exec: "Pinging target ", ping_ok: "HOST REACHABLE", ping_fail: "HOST UNREACHABLE",
         modal_conn_title: "CONNECT TO NETWORK", modal_conn_btn: "CONNECT", modal_cancel_btn: "CANCEL",
         settings_title: "SYSTEM CONFIGURATION", lbl_lang: "INTERFACE LANGUAGE:", lbl_ap_ssid: "BROADCAST SSID:", lbl_ap_pass: "ACCESS KEY:",
-        btn_save_settings: "SAVE & REBOOT", btn_close_settings: "CLOSE"
+        btn_save_settings: "SAVE & REBOOT", btn_close_settings: "CLOSE",
+        term_init: "Czech Blade Shell v3.0\nType 'help' for commands. (TAB = completion)\n------------------------------------------------"
       }
     };
 
@@ -536,6 +1121,7 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       document.getElementById('nav-text-geiger').innerText = t.nav_geiger;
       document.getElementById('nav-text-ble').innerText = t.nav_ble;
       document.getElementById('nav-text-ping').innerText = t.nav_ping;
+      document.getElementById('nav-text-term').innerText = t.nav_term;
 
       document.getElementById('hdr-wifi').innerText = t.hdr_wifi;
       document.getElementById('btn-scan-wifi').innerText = t.btn_scan_wifi;
@@ -758,6 +1344,97 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       checkInternetStatus();
     }
 
+    // Web Shell: šipky Nahoru/Dolů + doplňování přes TAB
+    function handleTermKey(e) {
+      const input = document.getElementById('term-in');
+
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        let val = input.value;
+        if (!val) return;
+
+        let matches = tabCommands.filter(c => c.startsWith(val.toLowerCase()));
+        if (matches.length === 1) {
+          input.value = matches[0] + " ";
+        } else if (matches.length > 1) {
+          const out = document.getElementById('term-out');
+          out.innerHTML += `\n<span style="color:var(--muted);">${matches.join('   ')}</span>\n<span class="term-prompt">esp@czechblade&gt;</span> ${val}`;
+          out.scrollTop = out.scrollHeight;
+        }
+        return;
+      }
+
+      if (e.key === 'Enter') {
+        sendTermCmd();
+      } else if (e.key === 'ArrowUp') {
+        if (cmdHistory.length > 0 && historyIdx < cmdHistory.length - 1) {
+          historyIdx++;
+          input.value = cmdHistory[cmdHistory.length - 1 - historyIdx];
+        }
+        e.preventDefault();
+      } else if (e.key === 'ArrowDown') {
+        if (historyIdx > 0) {
+          historyIdx--;
+          input.value = cmdHistory[cmdHistory.length - 1 - historyIdx];
+        } else if (historyIdx === 0) {
+          historyIdx = -1;
+          input.value = "";
+        }
+        e.preventDefault();
+      }
+    }
+
+    async function sendTermCmd() {
+      const input = document.getElementById('term-in');
+      const out = document.getElementById('term-out');
+      const cmd = input.value.trim();
+      if (!cmd) return;
+
+      cmdHistory.push(cmd);
+      historyIdx = -1;
+
+      if (cmd.toLowerCase() === 'clear') {
+        out.innerHTML = "";
+        input.value = "";
+        return;
+      }
+
+      out.innerHTML += `\n<span class="term-prompt">esp@czechblade&gt;</span> ${cmd}\n`;
+      input.value = "";
+
+      let loadingSpan = document.createElement("span");
+      loadingSpan.style.color = "var(--muted)";
+      out.appendChild(loadingSpan);
+
+      let dots = 1;
+      let loadTimer = setInterval(() => {
+        dots = (dots % 4) + 1;
+        loadingSpan.innerText = ".".repeat(dots);
+        out.scrollTop = out.scrollHeight;
+      }, 250);
+
+      try {
+        let res = await fetch('/api/terminal?cmd=' + encodeURIComponent(cmd));
+        let reply = await res.text();
+        clearInterval(loadTimer);
+        loadingSpan.remove();
+        out.innerHTML += `${reply}`;
+
+        if (cmd.startsWith("set lang ") || cmd.startsWith("set lang-d ")) {
+          let parts = cmd.split(" ");
+          let l = parts[parts.length - 1].toLowerCase();
+          if (l === "cz" || l === "eng" || l === "en") {
+            setLanguage(l);
+          }
+        }
+      } catch (e) {
+        clearInterval(loadTimer);
+        loadingSpan.remove();
+        out.innerHTML += `[Connection Error]`;
+      }
+      out.scrollTop = out.scrollHeight;
+    }
+
     async function checkInternetStatus(checking = false) {
       const tag = document.getElementById('tag-net');
       const txt = document.getElementById('net-txt');
@@ -805,6 +1482,7 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
 
     fetch('/api/get-lang').then(r => r.text()).then(l => {
       setLanguage(l);
+      document.getElementById('term-out').innerText = dict[currentLang].term_init;
     });
 
     setInterval(checkInternetStatus, 8000);
@@ -818,8 +1496,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
 
-  // Hardwarová indikace startu verze 1.5 (1x dlouhé + 5x krátké)
-  blinkVersion1_5();
+  // Hardwarová indikace startu verze 3.0 (3x dlouhé bliknutí)
+  blinkVersion3_0();
 
   prefs.begin("blade", false);
   currentLang = prefs.getString("lang", "eng");
@@ -828,6 +1506,11 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSSID.c_str(), apPass.c_str());
 
+  // Spuštění Telnet serveru na portu 23
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+
+  // Inicializace BLE
   BLEDevice::init("CzechBlade");
   pBLEScan = BLEDevice::getScan();
   pBLEScan->setActiveScan(true);
@@ -841,20 +1524,28 @@ void setup() {
 
   // 2. Wi-Fi Scanner
   server.on("/api/scan-wifi", HTTP_GET, [](AsyncWebServerRequest *request){
-    digitalWrite(LED_PIN, HIGH);
+    setLedState(true);
     int n = WiFi.scanNetworks(false, true);
+    lastScannedNets.clear();
     DynamicJsonDocument doc(4096);
     JsonArray arr = doc.to<JsonArray>();
 
     for (int i = 0; i < n; ++i) {
+      ScannedNet item;
+      item.ssid = WiFi.SSID(i);
+      item.rssi = WiFi.RSSI(i);
+      item.ch = WiFi.channel(i);
+      item.bssid = WiFi.BSSIDstr(i);
+      lastScannedNets.push_back(item);
+
       JsonObject net = arr.createNestedObject();
-      net["ssid"] = WiFi.SSID(i);
-      net["rssi"] = WiFi.RSSI(i);
-      net["bssid"] = WiFi.BSSIDstr(i);
-      net["ch"] = WiFi.channel(i);
+      net["ssid"] = item.ssid;
+      net["rssi"] = item.rssi;
+      net["bssid"] = item.bssid;
+      net["ch"] = item.ch;
     }
     WiFi.scanDelete();
-    digitalWrite(LED_PIN, LOW);
+    setLedState(false);
 
     String response;
     serializeJson(doc, response);
@@ -866,7 +1557,7 @@ void setup() {
     String ssid = request->hasParam("ssid") ? request->getParam("ssid")->value() : "";
     String pass = request->hasParam("pass") ? request->getParam("pass")->value() : "";
 
-    digitalWrite(LED_PIN, HIGH);
+    setLedState(true);
     WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : NULL);
 
     int timeout = 0;
@@ -874,7 +1565,7 @@ void setup() {
       delay(200);
       timeout++;
     }
-    digitalWrite(LED_PIN, LOW);
+    setLedState(false);
 
     bool connected = (WiFi.status() == WL_CONNECTED);
 
@@ -893,7 +1584,7 @@ void setup() {
     int rssi = -105;
 
     if (target.length() > 0) {
-      digitalWrite(LED_PIN, HIGH);
+      setLedState(true);
       int n = WiFi.scanNetworks(false, true);
       for (int i = 0; i < n; ++i) {
         if (WiFi.SSID(i) == target) {
@@ -903,7 +1594,7 @@ void setup() {
         }
       }
       WiFi.scanDelete();
-      digitalWrite(LED_PIN, LOW);
+      setLedState(false);
     }
 
     DynamicJsonDocument doc(64);
@@ -934,7 +1625,7 @@ void setup() {
   server.on("/api/scan-ble-start", HTTP_GET, [](AsyncWebServerRequest *request){
     if (!isBleScanning) {
       isBleScanning = true;
-      digitalWrite(LED_PIN, HIGH);
+      setLedState(true);
       pBLEScan->stop();
       pBLEScan->clearResults();
       pBLEScan->start(2, onBleScanComplete, false);
@@ -942,7 +1633,7 @@ void setup() {
     request->send(200, "text/plain", "SCANNING");
   });
 
-  // 6B. BLE Scanner - Results (Vyzvednutí výsledků)
+  // 6B. BLE Scanner - Results
   server.on("/api/scan-ble-results", HTTP_GET, [](AsyncWebServerRequest *request){
     DynamicJsonDocument doc(4096);
     JsonArray arr = doc.to<JsonArray>();
@@ -973,7 +1664,7 @@ void setup() {
       return;
     }
 
-    digitalWrite(LED_PIN, HIGH);
+    setLedState(true);
 
     int successCount = 0;
     float totalTime = 0.0;
@@ -987,7 +1678,7 @@ void setup() {
       delay(20);
     }
 
-    digitalWrite(LED_PIN, LOW);
+    setLedState(false);
 
     bool ok = (successCount > 0);
     doc["success"] = ok;
@@ -999,7 +1690,45 @@ void setup() {
     request->send(200, "application/json", response);
   });
 
-  // 8. Status
+  // 8. Web Terminal Endpoint
+  server.on("/api/terminal", HTTP_GET, [](AsyncWebServerRequest *request){
+    String cmd = request->hasParam("cmd") ? request->getParam("cmd")->value() : "";
+    cmd.trim();
+    String reply = "";
+    bool cz = (currentLang == "cz");
+
+    if (pendingRebootWeb) {
+      if (cmd.equalsIgnoreCase("y")) {
+        pendingRebootWeb = false;
+        request->send(200, "text/plain", cz ? "Restartuji Czech Blade..." : "Restarting Czech Blade...");
+        delay(400);
+        ESP.restart();
+        return;
+      } else {
+        pendingRebootWeb = false;
+        reply = cz ? "Restart zrusen." : "Reboot aborted.";
+      }
+    }
+    else if (cmd == "reboot") {
+      pendingRebootWeb = true;
+      reply = cz ? "Opravdu chcete restartovat Czech Blade? [y/N]: " : "Do you want to reboot? [y/N]: ";
+    }
+    else {
+      reply = processCommand(cmd, false);
+      if (cmd == "sleep" || cmd.startsWith("sleep ")) {
+        int sec = 0;
+        if (cmd.startsWith("sleep ")) sec = cmd.substring(6).toInt();
+        request->send(200, "text/plain", reply);
+        delay(300);
+        executeSleep(sec);
+        return;
+      }
+    }
+
+    request->send(200, "text/plain", reply);
+  });
+
+  // 9. Status
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
     DynamicJsonDocument doc(128);
     bool wifiConn = (WiFi.status() == WL_CONNECTED);
@@ -1022,7 +1751,7 @@ void setup() {
     request->send(200, "application/json", response);
   });
 
-  // 9. NVS Language API
+  // 10. Jazyk NVS
   server.on("/api/get-lang", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/plain", currentLang);
   });
@@ -1039,14 +1768,14 @@ void setup() {
     request->send(400, "text/plain", "Error");
   });
 
-  // 10. AP Config
+  // 11. AP Config
   server.on("/api/set-ap", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("ssid")) {
       apSSID = request->getParam("ssid")->value();
       apPass = request->hasParam("pass") ? request->getParam("pass")->value() : "";
 
       request->send(200, "text/plain", "OK");
-      digitalWrite(LED_PIN, HIGH); delay(80); digitalWrite(LED_PIN, LOW);
+      blinkLed(4, 60);
       WiFi.softAPdisconnect(true);
       WiFi.softAP(apSSID.c_str(), apPass.length() >= 8 ? apPass.c_str() : NULL);
       return;
@@ -1058,5 +1787,237 @@ void setup() {
 }
 
 void loop() {
-  delay(100);
+  // Telnet klient
+  if (telnetServer.hasClient()) {
+    if (!telnetClient || !telnetClient.connected()) {
+      if (telnetClient) telnetClient.stop();
+      telnetClient = telnetServer.available();
+      telnetInputBuffer = "";
+      telnetCursorPos = 0;
+      telnetHistIdx = -1;
+      pendingRebootTelnet = false;
+
+      uint8_t telnetInit[] = { 255, 251, 1, 255, 251, 3, 255, 253, 34 };
+      telnetClient.write(telnetInit, sizeof(telnetInit));
+
+      telnetClient.print("\r\n\033[1;38;5;208m=== Czech Blade Telnet Shell v3.0 ===\033[0m\r\n");
+      telnetClient.println("Type 'help' for available commands. (TAB for auto-completion)\r\n");
+      telnetClient.print("\033[1;32mesp@czechblade>\033[0m ");
+    }
+  }
+
+  if (telnetClient && telnetClient.connected()) {
+    while (telnetClient.available()) {
+      char c = telnetClient.read();
+
+      // Klávesa TAB pro Telnet
+      if (c == '\t') {
+        if (telnetInputBuffer.length() > 0) {
+          String toMatch = telnetInputBuffer;
+          toMatch.toLowerCase();
+
+          std::vector<String> matches;
+          for (const auto& cmdItem : commandList) {
+            if (cmdItem.startsWith(toMatch)) {
+              matches.push_back(cmdItem);
+            }
+          }
+
+          if (matches.size() == 1) {
+            while (telnetCursorPos < (int)telnetInputBuffer.length()) {
+              telnetClient.print("\033[C");
+              telnetCursorPos++;
+            }
+            while (telnetInputBuffer.length() > 0) {
+              telnetClient.print("\b \b");
+              telnetInputBuffer.remove(telnetInputBuffer.length() - 1);
+            }
+            telnetInputBuffer = matches[0] + " ";
+            telnetCursorPos = telnetInputBuffer.length();
+            telnetClient.print(telnetInputBuffer);
+          } else if (matches.size() > 1) {
+            telnetClient.print("\r\n\033[33m");
+            for (const auto& m : matches) {
+              telnetClient.print(m + "   ");
+            }
+            telnetClient.print("\033[0m\r\n\033[1;32mesp@czechblade>\033[0m ");
+            telnetClient.print(telnetInputBuffer);
+          }
+        }
+        continue;
+      }
+
+      // Detekce ANSI šipek
+      if (c == 27) {
+        if (telnetClient.available() >= 2) {
+          char c1 = telnetClient.read();
+          char c2 = telnetClient.read();
+          if (c1 == '[') {
+            // Šipka NAHORU
+            if (c2 == 'A') {
+              if (telnetHistCount > 0 && telnetHistIdx < telnetHistCount - 1) {
+                telnetHistIdx++;
+                while (telnetCursorPos < (int)telnetInputBuffer.length()) {
+                  telnetClient.print("\033[C");
+                  telnetCursorPos++;
+                }
+                while (telnetInputBuffer.length() > 0) {
+                  telnetClient.print("\b \b");
+                  telnetInputBuffer.remove(telnetInputBuffer.length() - 1);
+                }
+                telnetInputBuffer = telnetHistory[telnetHistCount - 1 - telnetHistIdx];
+                telnetCursorPos = telnetInputBuffer.length();
+                telnetClient.print(telnetInputBuffer);
+              }
+            }
+            // Šipka DOLŮ
+            else if (c2 == 'B') {
+              if (telnetHistIdx > 0) {
+                telnetHistIdx--;
+                while (telnetCursorPos < (int)telnetInputBuffer.length()) {
+                  telnetClient.print("\033[C");
+                  telnetCursorPos++;
+                }
+                while (telnetInputBuffer.length() > 0) {
+                  telnetClient.print("\b \b");
+                  telnetInputBuffer.remove(telnetInputBuffer.length() - 1);
+                }
+                telnetInputBuffer = telnetHistory[telnetHistCount - 1 - telnetHistIdx];
+                telnetCursorPos = telnetInputBuffer.length();
+                telnetClient.print(telnetInputBuffer);
+              } else if (telnetHistIdx == 0) {
+                telnetHistIdx = -1;
+                while (telnetCursorPos < (int)telnetInputBuffer.length()) {
+                  telnetClient.print("\033[C");
+                  telnetCursorPos++;
+                }
+                while (telnetInputBuffer.length() > 0) {
+                  telnetClient.print("\b \b");
+                  telnetInputBuffer.remove(telnetInputBuffer.length() - 1);
+                }
+                telnetCursorPos = 0;
+              }
+            }
+            // Šipka VPRAVO
+            else if (c2 == 'C') {
+              if (telnetCursorPos < (int)telnetInputBuffer.length()) {
+                telnetCursorPos++;
+                telnetClient.print("\033[C");
+              }
+            }
+            // Šipka VLEVO
+            else if (c2 == 'D') {
+              if (telnetCursorPos > 0) {
+                telnetCursorPos--;
+                telnetClient.print("\033[D");
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // Enter
+      if (c == '\r' || c == '\n') {
+        telnetClient.print("\r\n");
+        telnetInputBuffer.trim();
+
+        if (pendingRebootTelnet) {
+          if (telnetInputBuffer.equalsIgnoreCase("y")) {
+            telnetClient.println(currentLang == "cz" ? "Restartuji Czech Blade..." : "Restarting Czech Blade...");
+            telnetClient.flush();
+            delay(400);
+            ESP.restart();
+          } else {
+            pendingRebootTelnet = false;
+            telnetClient.println(currentLang == "cz" ? "Restart zrusen." : "Reboot aborted.");
+          }
+          telnetInputBuffer = "";
+          telnetCursorPos = 0;
+          telnetClient.print("\033[1;32mesp@czechblade>\033[0m ");
+          break;
+        }
+
+        if (telnetInputBuffer.length() > 0) {
+          if (telnetHistCount < TELNET_HIST_SIZE) {
+            telnetHistory[telnetHistCount++] = telnetInputBuffer;
+          } else {
+            for (int i = 0; i < TELNET_HIST_SIZE - 1; i++) {
+              telnetHistory[i] = telnetHistory[i + 1];
+            }
+            telnetHistory[TELNET_HIST_SIZE - 1] = telnetInputBuffer;
+          }
+          telnetHistIdx = -1;
+
+          if (telnetInputBuffer == "clear") {
+            telnetClient.print("\033[2J\033[H");
+          } else if (telnetInputBuffer == "reboot") {
+            pendingRebootTelnet = true;
+            telnetClient.print(currentLang == "cz" ? "Opravdu chcete restartovat Czech Blade? [y/N]: " : "Do you want to reboot? [y/N]: ");
+            telnetInputBuffer = "";
+            telnetCursorPos = 0;
+            break;
+          } else {
+            bool hasLoading = telnetInputBuffer.startsWith("wifi scan") || 
+                              telnetInputBuffer.startsWith("bt scan") || 
+                              telnetInputBuffer.startsWith("wifi connect") ||
+                              telnetInputBuffer.startsWith("wifi-repeat") ||
+                              telnetInputBuffer.startsWith("wifi signal") ||
+                              telnetInputBuffer.startsWith("ping");
+
+            if (hasLoading) {
+              telnetClient.print(currentLang == "cz" ? "Zpracovavam... " : "Processing... ");
+            }
+
+            String reply = processCommand(telnetInputBuffer, true);
+
+            if (hasLoading) {
+              telnetClient.print("\r\033[K");
+            }
+
+            reply.replace("\n", "\r\n");
+            telnetClient.print(reply);
+            telnetClient.print("\r\n");
+          }
+          telnetInputBuffer = "";
+          telnetCursorPos = 0;
+        }
+        telnetClient.print("\033[1;32mesp@czechblade>\033[0m ");
+        break;
+      }
+      // Backspace
+      else if (c == 8 || c == 127) {
+        if (telnetCursorPos > 0) {
+          telnetInputBuffer.remove(telnetCursorPos - 1, 1);
+          telnetCursorPos--;
+          telnetClient.print("\b\033[K");
+          if (telnetCursorPos < (int)telnetInputBuffer.length()) {
+            String rest = telnetInputBuffer.substring(telnetCursorPos);
+            telnetClient.print(rest);
+            for (int i = 0; i < (int)rest.length(); i++) {
+              telnetClient.print("\033[D");
+            }
+          }
+        }
+      }
+      // Běžný ASCII znak
+      else if (c >= 32 && c <= 126) {
+        if (telnetCursorPos == (int)telnetInputBuffer.length()) {
+          telnetInputBuffer += c;
+          telnetCursorPos++;
+          telnetClient.print(c);
+        } else {
+          telnetInputBuffer = telnetInputBuffer.substring(0, telnetCursorPos) + c + telnetInputBuffer.substring(telnetCursorPos);
+          telnetCursorPos++;
+          String rest = telnetInputBuffer.substring(telnetCursorPos - 1);
+          telnetClient.print(rest);
+          for (int i = 0; i < (int)rest.length() - 1; i++) {
+            telnetClient.print("\033[D");
+          }
+        }
+      }
+    }
+  }
+
+  delay(15);
 }
