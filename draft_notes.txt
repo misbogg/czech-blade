@@ -1,0 +1,10 @@
+﻿## Work in Progress / Development Build
+
+### Terminal & Console Engine
+- **Linux-styled Prompt:** Colorful \esp@czechblade>\ interface with clean visual output.
+- **Command History:** Full Up/Down arrow navigation through command buffer.
+- **Telnet Server:** Active on port 23, sharing the exact same command parser as the Web Terminal.
+- **Bilingual Interface:** Real-time English and Czech support for both UI and terminal output (\set lang <cz|eng>\).
+- **Persistent Settings:** Permanent default language storage in Flash NVS (\set lang-d <cz|eng>\).
+- **Extended CLI Commands:** \scan\, \connect\, \signal\, \phone\, \le\, \ping\, \setap\, \led\, \status ip\, \wifi status\, and easter egg \matrix\ mode.
+- **Animated Activity Feedback:** Dynamic loading dots indicating running background jobs.
